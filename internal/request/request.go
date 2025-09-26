@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+
+	"github.com/seandisero/httpfromtcp/internal/headers"
 )
 
 const (
@@ -17,12 +20,17 @@ type RequestState int
 
 const (
 	requestStateInitialized RequestState = iota
+	requestStateParsingHeaders
+	requestStateParsingBody
 	requestStateDone
 )
 
 type Request struct {
-	RequestLine RequestLine
-	state       RequestState
+	RequestLine    RequestLine
+	Headers        headers.Headers
+	Body           []byte
+	state          RequestState
+	bodyLengthRead int
 }
 
 type RequestLine struct {
@@ -53,7 +61,7 @@ func (cr *chunkReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (r *Request) parse(data []byte) (int, error) {
+func (r *Request) parseSingle(data []byte) (int, error) {
 	switch r.state {
 	case requestStateInitialized:
 		req, idx, err := parseRequestLine(data)
@@ -65,8 +73,37 @@ func (r *Request) parse(data []byte) (int, error) {
 			return 0, nil
 		}
 		r.RequestLine = *req
-		r.state = requestStateDone
+		r.state = requestStateParsingHeaders
 		return idx, nil
+	case requestStateParsingHeaders:
+		n, done, err := r.Headers.Parse(data)
+		if err != nil {
+			return 0, err
+		}
+		if done {
+			r.state = requestStateParsingBody
+		}
+		return n, nil
+	case requestStateParsingBody:
+		contentLenStr, ok := r.Headers.Get("Content-Length")
+		if !ok {
+			// assume that if no content-length header is present, there is no body
+			r.state = requestStateDone
+			return len(data), nil
+		}
+		contentLen, err := strconv.Atoi(contentLenStr)
+		if err != nil {
+			return 0, fmt.Errorf("malformed Content-Length: %s", err)
+		}
+		r.Body = append(r.Body, data...)
+		r.bodyLengthRead += len(data)
+		if r.bodyLengthRead > contentLen {
+			return 0, fmt.Errorf("Content-Length too large")
+		}
+		if r.bodyLengthRead == contentLen {
+			r.state = requestStateDone
+		}
+		return len(data), nil
 	case requestStateDone:
 		return 0, fmt.Errorf("parsing is done")
 	default:
@@ -74,11 +111,29 @@ func (r *Request) parse(data []byte) (int, error) {
 	}
 }
 
+func (r *Request) parse(data []byte) (int, error) {
+	totalBytesParsed := 0
+	for r.state != requestStateDone {
+		n, err := r.parseSingle(data[totalBytesParsed:])
+		if err != nil {
+			return 0, err
+		}
+
+		totalBytesParsed += n
+		if n == 0 {
+			break
+		}
+	}
+	return totalBytesParsed, nil
+}
+
 func RequestFromReader(reader io.Reader) (*Request, error) {
 	buf := make([]byte, bufferSize)
 	readToIndex := 0
 	req := &Request{
-		state: requestStateInitialized,
+		Headers: headers.NewHeaders(),
+		Body:    make([]byte, 0),
+		state:   requestStateInitialized,
 	}
 
 	for req.state != requestStateDone {
@@ -88,16 +143,18 @@ func RequestFromReader(reader io.Reader) (*Request, error) {
 			buf = newBuf
 		}
 
-		n, err := reader.Read(buf[readToIndex:])
+		numBytesRead, err := reader.Read(buf[readToIndex:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				req.state = requestStateDone
-			} else {
-				return nil, err
+				if req.state != requestStateDone {
+					return nil, fmt.Errorf("incompete request, in state %d, read n bytes on EOF: %d", req.state, numBytesRead)
+				}
+				break
 			}
+			return nil, err
 		}
+		readToIndex += numBytesRead
 
-		readToIndex += n
 		numBytesParsed, err := req.parse(buf[:readToIndex])
 		if err != nil {
 			return nil, err
