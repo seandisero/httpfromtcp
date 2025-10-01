@@ -62,6 +62,16 @@ func (h Headers) Set(key, value string) {
 	h[key] = value
 }
 
+func (h Headers) Replace(key, value string) {
+	key = strings.ToLower(key)
+	h[key] = value
+}
+
+func (h Headers) Remove(key string) {
+	lowerKey := strings.ToLower(key)
+	delete(h, lowerKey)
+}
+
 var tokenChars = []byte{'!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~'}
 
 // validTokens checks if the data contains only valid tokens
@@ -84,4 +94,3 @@ func isTokenChar(c byte) bool {
 
 	return slices.Contains(tokenChars, c)
 }
-
